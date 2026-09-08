@@ -190,24 +190,26 @@ def refine_sparse_result(
     Theta,
     y,
     coefficient_threshold=0.1,
-    importance_threshold=0.1,
+    importance_threshold=0,
     method="Powell",
     print_result=True,
 ):
     """
     Refine a sparse EE model using coefficient pre-screening
-    followed by leave-one-out feature importance analysis.
+    followed by iterative leave-one-out feature pruning.
 
     The procedure is:
 
         1. Start from an existing sparse regression result.
         2. Remove features with small absolute coefficients.
         3. Re-optimise the remaining features.
-        4. For each remaining feature, calculate its leave-one-out
-           MI without re-optimisation.
-        5. Remove features whose MI contribution is below
-           importance_threshold.
-        6. Re-optimise the remaining features once more.
+        4. Calculate leave-one-out MI contribution for every
+           remaining feature without re-optimisation.
+        5. If the smallest contribution is below
+           importance_threshold, remove only that feature.
+        6. Re-optimise the remaining features and repeat.
+        7. Stop when all remaining features have contribution
+           >= importance_threshold.
 
     Parameters
     ----------
@@ -225,8 +227,8 @@ def refine_sparse_result(
         removed during the initial screening.
 
     importance_threshold : float
-        Features with delta_mi below this value are removed
-        after leave-one-out analysis.
+        Iterative refinement stops when every remaining feature
+        has delta_mi >= this value.
 
     method : str
         Optimisation method passed to scipy.optimize.minimize.
@@ -252,9 +254,11 @@ def refine_sparse_result(
         dtype=float
     )
 
-    active_indices = np.asarray(
+    original_active_indices = np.asarray(
         sparse_result["active_indices"]
     ).copy()
+
+    active_indices = original_active_indices.copy()
 
     feature_names = sparse_result[
         "library_feature_names"
@@ -266,6 +270,53 @@ def refine_sparse_result(
         "library_power_results",
         []
     )
+
+    # ==========================================================
+    # Helper: optimise current active features
+    # ==========================================================
+
+    def optimise_active(active_indices,x0=None):
+
+        Theta_active = Theta[:, active_indices]
+
+        if x0 is None:
+            x0 = np.ones(len(active_indices))
+
+        result = minimize(
+            scipy_objective,
+            x0=x0,
+            args=(Theta_active, y),
+            method=method
+        )
+
+        coeff = result.x.astype(float)
+
+        coeff /= np.linalg.norm(coeff)
+
+        u = Theta_active @ coeff
+
+        gamma = (
+            np.cov(u, y, bias=True)[0, 1]
+            / np.var(u)
+        )
+
+        coeff *= gamma
+
+        # Fix sign
+        idx = np.argmax(np.abs(coeff))
+
+        if coeff[idx] < 0:
+            coeff *= -1
+
+        mi = ee.mi(u, y)
+
+        return {
+            "result": result,
+            "coeff": coeff,
+            "u": u,
+            "mi": mi,
+            "Theta_active": Theta_active,
+        }
 
     # ==========================================================
     # Step 1: Coefficient pre-screening
@@ -306,7 +357,7 @@ def refine_sparse_result(
 
         for name, c, keep in zip(
             np.array(feature_names)[
-                sparse_result["active_indices"]
+                original_active_indices
             ],
             coeff,
             coefficient_keep
@@ -320,63 +371,47 @@ def refine_sparse_result(
             )
 
     # ==========================================================
-    # Step 2: Re-optimise after coefficient screening
+    # Step 2: Initial re-optimisation
     # ==========================================================
 
-    Theta_active = Theta[:, active_indices]
+    coeff = coeff[coefficient_keep]
 
-    result = minimize(
-        scipy_objective,
-        x0=np.ones(len(active_indices)),
-        args=(Theta_active, y),
-        method=method
+    current_model = optimise_active(
+        active_indices,
+        x0=coeff
     )
 
-    coeff = result.x.astype(float)
-
-    coeff /= np.linalg.norm(coeff)
-
-    u = Theta_active @ coeff
-
-    gamma = (
-        np.cov(u, y, bias=True)[0, 1]
-        / np.var(u)
-    )
-
-    coeff *= gamma
-
-    # Fix sign
-    idx = np.argmax(np.abs(coeff))
-
-    if coeff[idx] < 0:
-        coeff *= -1
-
-    full_mi = ee.mi(u, y)
+    full_mi = current_model["mi"]
 
     # ==========================================================
-    # Step 3: Leave-one-out feature importance
+    # Step 3: Iterative leave-one-out refinement
     # ==========================================================
 
-    feature_results = []
+    refinement_history = []
 
-    for i in range(len(active_indices)):
+    iteration = 0
 
-        keep = np.ones(
-            len(active_indices),
-            dtype=bool
-        )
+    while len(active_indices) > 1:
 
-        keep[i] = False
+        iteration += 1
 
-        if keep.sum() == 0:
+        Theta_active = Theta[:, active_indices]
 
-            mi_without = 0.0
+        feature_results = []
 
-        else:
+        # ------------------------------------------------------
+        # Calculate leave-one-out contribution
+        # ------------------------------------------------------
 
-            # IMPORTANT:
-            # No re-optimisation here.
-            # Use the current coefficients directly.
+        for i in range(len(active_indices)):
+
+            keep = np.ones(
+                len(active_indices),
+                dtype=bool
+            )
+
+            keep[i] = False
+
             u_without = (
                 Theta_active[:, keep]
                 @ coeff[keep]
@@ -387,131 +422,241 @@ def refine_sparse_result(
                 y
             )
 
-        delta_mi = (
-            full_mi
-            - mi_without
-        )
+            delta_mi = (
+                full_mi
+                - mi_without
+            )
 
-        feature_results.append({
-            "feature":
-                feature_names[
-                    active_indices[i]
-                ],
-            "coefficient":
-                coeff[i],
-            "mi_without":
-                mi_without,
-            "delta_mi":
-                delta_mi,
-        })
+            feature_results.append({
+                "feature":
+                    feature_names[
+                        active_indices[i]
+                    ],
+                "library_index":
+                    active_indices[i],
+                "coefficient":
+                    coeff[i],
+                "mi_without":
+                    mi_without,
+                "delta_mi":
+                    delta_mi,
+            })
 
-    # ==========================================================
-    # Step 4: Importance-based pruning
-    # ==========================================================
+        # ------------------------------------------------------
+        # Find feature with smallest contribution
+        # ------------------------------------------------------
 
-    importance_keep = np.array([
-        r["delta_mi"] >= importance_threshold
-        for r in feature_results
-    ])
-
-    # Always keep at least one feature
-    if not np.any(importance_keep):
-
-        best_idx = np.argmax([
+        worst_idx = np.argmin([
             r["delta_mi"]
             for r in feature_results
         ])
 
-        importance_keep[best_idx] = True
+        worst_feature = feature_results[
+            worst_idx
+        ]
 
-    if print_result:
+        min_delta_mi = worst_feature[
+            "delta_mi"
+        ]
 
-        print(
-            "\n===== Leave-one-out Feature Importance ====="
-        )
+        if print_result:
 
-        print(
-            f"Full MI : {full_mi:.6f}"
-        )
-
-        print()
-
-        for r, keep in zip(
-            feature_results,
-            importance_keep
-        ):
-
-            status = (
-                "KEEP"
-                if keep
-                else "REMOVE"
+            print(
+                f"\n===== Refinement Iteration "
+                f"{iteration} ====="
             )
 
             print(
-                f"{r['feature']:35s}: "
-                f"coeff={r['coefficient']: .6f}  "
-                f"MI(-f)={r['mi_without']: .6f}  "
-                f"ΔMI={r['delta_mi']: .6f}  "
-                f"{status}"
+                f"Current MI : "
+                f"{full_mi:.6f}"
             )
 
-    active_indices = active_indices[
-        importance_keep
-    ]
+            print()
+
+            for i, r in enumerate(
+                feature_results
+            ):
+
+                marker = (
+                    "  <-- lowest"
+                    if i == worst_idx
+                    else ""
+                )
+
+                print(
+                    f"{r['feature']:35s}: "
+                    f"coeff={r['coefficient']: .6f}  "
+                    f"MI(-f)={r['mi_without']: .6f}  "
+                    f"ΔMI={r['delta_mi']: .6f}"
+                    f"{marker}"
+                )
+
+        # ------------------------------------------------------
+        # Stop if every feature is important enough
+        # ------------------------------------------------------
+
+        if min_delta_mi >= importance_threshold:
+
+            if print_result:
+
+                print(
+                    "\nAll remaining features have "
+                    f"ΔMI >= {importance_threshold:.6f}."
+                )
+
+                print(
+                    "Refinement stopped."
+                )
+
+            break
+
+        # ------------------------------------------------------
+        # Remove only the worst feature
+        # ------------------------------------------------------
+
+        removed_feature = (
+            feature_names[
+                active_indices[worst_idx]
+            ]
+        )
+
+        refinement_history.append({
+            "iteration":
+                iteration,
+            "full_mi":
+                full_mi,
+            "feature_results":
+                feature_results,
+            "removed_feature":
+                removed_feature,
+            "removed_index":
+                active_indices[worst_idx],
+            "removed_delta_mi":
+                min_delta_mi,
+        })
+
+        if print_result:
+
+            print()
+
+            print(
+                f"Removing: "
+                f"{removed_feature}"
+            )
+
+            print(
+                f"ΔMI = "
+                f"{min_delta_mi:.6f}"
+            )
+
+        keep = np.ones(
+            len(active_indices),
+            dtype=bool
+        )
+        keep[worst_idx] = False
+
+        x0 = coeff[keep]
+
+        active_indices = active_indices[
+            keep
+        ]
+
+        # ------------------------------------------------------
+        # Re-optimise after removing one feature
+        # ------------------------------------------------------
+
+        current_model = optimise_active(
+            active_indices,
+            x0=x0
+        )
+
+        coeff = current_model["coeff"]
+
+        full_mi = current_model["mi"]
+
+        if print_result:
+
+            print(
+                f"MI after re-optimisation: "
+                f"{full_mi:.6f}"
+            )
 
     # ==========================================================
-    # Step 5: Final re-optimisation
+    # Final model
     # ==========================================================
 
-    Theta_final = Theta[:, active_indices]
+    final_result = current_model["result"]
 
-    final_result = minimize(
-        scipy_objective,
-        x0=np.ones(len(active_indices)),
-        args=(Theta_final, y),
-        method=method
-    )
+    final_coeff = current_model["coeff"]
 
-    final_coeff = (
-        final_result.x.astype(float)
-    )
-
-    final_coeff /= np.linalg.norm(
-        final_coeff
-    )
-
-    u_final = (
-        Theta_final @ final_coeff
-    )
-
-    gamma = (
-        np.cov(
-            u_final,
-            y,
-            bias=True
-        )[0, 1]
-        / np.var(u_final)
-    )
-
-    final_coeff *= gamma
-
-    # Fix sign
-    idx = np.argmax(
-        np.abs(final_coeff)
-    )
-
-    if final_coeff[idx] < 0:
-        final_coeff *= -1
-
-    final_mi = ee.mi(
-        u_final,
-        y
-    )
+    final_mi = current_model["mi"]
 
     final_names = [
         feature_names[i]
         for i in active_indices
     ]
+
+    # ==========================================================
+    # Final feature importance
+    # ==========================================================
+
+    final_feature_results = []
+
+    Theta_final = Theta[:, active_indices]
+
+    if len(active_indices) == 1:
+
+        final_feature_results.append({
+            "feature":
+                final_names[0],
+            "library_index":
+                active_indices[0],
+            "coefficient":
+                final_coeff[0],
+            "mi_without":
+                0.0,
+            "delta_mi":
+                final_mi,
+        })
+
+    else:
+
+        for i in range(len(active_indices)):
+
+            keep = np.ones(
+                len(active_indices),
+                dtype=bool
+            )
+
+            keep[i] = False
+
+            u_without = (
+                Theta_final[:, keep]
+                @ final_coeff[keep]
+            )
+
+            mi_without = ee.mi(
+                u_without,
+                y
+            )
+
+            delta_mi = (
+                final_mi
+                - mi_without
+            )
+
+            final_feature_results.append({
+                "feature":
+                    final_names[i],
+                "library_index":
+                    active_indices[i],
+                "coefficient":
+                    final_coeff[i],
+                "mi_without":
+                    mi_without,
+                "delta_mi":
+                    delta_mi,
+            })
 
     # ==========================================================
     # Print final result
@@ -525,7 +670,7 @@ def refine_sparse_result(
 
         print(
             f"Initial terms : "
-            f"{len(sparse_result['active_indices'])}"
+            f"{len(original_active_indices)}"
         )
 
         print(
@@ -564,7 +709,8 @@ def refine_sparse_result(
     # ==========================================================
 
     return {
-        "coeff": final_coeff,
+        "coeff":
+            final_coeff,
         "library_feature_names":
             feature_names,
         "feature_names":
@@ -580,11 +726,11 @@ def refine_sparse_result(
         "result":
             final_result,
         "feature_importance":
-            feature_results,
+            final_feature_results,
         "coefficient_keep":
             coefficient_keep,
-        "importance_keep":
-            importance_keep,
+        "refinement_history":
+            refinement_history,
         "original_sparse_result":
             sparse_result,
     }

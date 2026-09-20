@@ -50,6 +50,137 @@ def build_function_library(X, param_names=None):
 
     return Theta, feature_names
 
+def build_interaction_library(X, param_names=None):
+    X = np.asarray(X, dtype=float)
+
+    n_samples, n_params = X.shape
+
+    if param_names is None:
+        param_names = [f"x{i}" for i in range(n_params)]
+
+    if n_params != 10:
+        raise ValueError(
+            "build_interaction_library expects exactly 10 parameters."
+        )
+
+    # Map parameter names to column indices
+    param_index = {
+        name: i
+        for i, name in enumerate(param_names)
+    }
+
+    # Check required parameters
+    required_parameters = [
+        "C_p", "Za_p", "R_p",
+        "Emax_rv", "Emin_rv",
+        "C_s", "Za_s", "R_s",
+        "Emax_lv", "Emin_lv",
+    ]
+
+    missing = [
+        name
+        for name in required_parameters
+        if name not in param_index
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Missing parameters: {missing}"
+        )
+
+    features = []
+    feature_names = []
+
+    # --------------------------------------------------
+    # Original parameters
+    # --------------------------------------------------
+    for i in range(n_params):
+        features.append(X[:, i])
+        feature_names.append(param_names[i])
+
+    # --------------------------------------------------
+    # Parameter groups
+    # --------------------------------------------------
+    groups = [
+        # Ventricular parameters
+        [
+            "Emax_lv",
+            "Emin_lv",
+            "Emax_rv",
+            "Emin_rv",
+        ],
+
+        # Compliance
+        [
+            "C_s",
+            "C_p",
+        ],
+
+        # Resistance
+        [
+            "R_s",
+            "R_p",
+        ],
+
+        # Characteristic impedance
+        [
+            "Za_s",
+            "Za_p",
+        ],
+    ]
+
+    # --------------------------------------------------
+    # Pairwise interactions
+    # +, -, *, /
+    # --------------------------------------------------
+    for group in groups:
+
+        for i in range(len(group)):
+
+            for j in range(i + 1, len(group)):
+
+                name_i = group[i]
+                name_j = group[j]
+
+                idx_i = param_index[name_i]
+                idx_j = param_index[name_j]
+
+                x_i = X[:, idx_i]
+                x_j = X[:, idx_j]
+
+                # Addition
+                features.append(x_i + x_j)
+                feature_names.append(
+                    f"{name_i}+{name_j}"
+                )
+
+                # Subtraction
+                features.append(x_i - x_j)
+                feature_names.append(
+                    f"{name_i}-{name_j}"
+                )
+
+                # Multiplication
+                features.append(x_i * x_j)
+                feature_names.append(
+                    f"{name_i}*{name_j}"
+                )
+
+                # Division
+                if np.any(x_j == 0):
+                    raise ValueError(
+                        f"Cannot divide by zero in {name_i}/{name_j}."
+                    )
+
+                features.append(x_i / x_j)
+                feature_names.append(
+                    f"{name_i}/{name_j}"
+                )
+
+    Theta = np.column_stack(features)
+
+    return Theta, feature_names
+
 def power_features(
     X,
     y,

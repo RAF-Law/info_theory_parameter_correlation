@@ -18,7 +18,7 @@ def sparse_ee_interpretation(
     y,
     feature_names,
     scaler,
-    library_power_results=[],
+    library_power_results=None,
     threshold=0.1,
     max_iter=10,
     method="Powell",
@@ -29,24 +29,96 @@ def sparse_ee_interpretation(
     Theta = np.asarray(Theta)
     y = np.asarray(y)
 
+    if y.ndim not in (1, 2):
+        raise ValueError(
+            f"y must have shape (N,) or (N, M), got {y.shape}"
+        )
+
+    if Theta.shape[0] != y.shape[0]:
+        raise ValueError(
+            f"Theta and y have inconsistent number of samples: "
+            f"{Theta.shape[0]} vs {y.shape[0]}"
+        )
+
+    n_outputs = 1 if y.ndim == 1 else y.shape[1]
+
+    if n_outputs > 1:
+        print(f"Multi-output target detected: y shape = {y.shape}")
+    else:
+        print(f"Single-output target detected: y shape = {y.shape}")
+
+    if library_power_results is None:
+        library_power_results = []
+
     if resume and os.path.exists(checkpoint_file):
+
         with open(checkpoint_file, "rb") as f:
             checkpoint = pickle.load(f)
+
         iteration_start = checkpoint["iteration"] + 1
         active_indices = checkpoint["active_indices"]
+
+        # Restore history if available
+        history = checkpoint.get("history", [])
+
         print(f"Resume from iteration {iteration_start}")
+
     else:
+
         iteration_start = 0
         history = []
         active_indices = np.arange(Theta.shape[1])
 
+    def calculate_gamma(z, y):
+
+        z = np.asarray(z, dtype=float)
+        y = np.asarray(y, dtype=float)
+
+        # Center z
+        z_centered = z - np.mean(z)
+
+        # Single output
+        if y.ndim == 1:
+
+            y_centered = y - np.mean(y)
+
+            denominator = np.sum(z_centered ** 2)
+
+            if denominator == 0:
+                return 0.0
+
+            gamma = (
+                np.sum(z_centered * y_centered)
+                / denominator
+            )
+
+            return gamma
+
+        # Multi-output
+        else:
+
+            y_centered = y - np.mean(y, axis=0)
+
+            denominator = np.sum(z_centered ** 2)
+
+            if denominator == 0:
+                return 0.0
+
+            # Sum covariance-like contributions from all outputs
+            numerator = np.sum(
+                z_centered[:, None] * y_centered
+            )
+
+            gamma = numerator / denominator
+
+            return gamma
+
     for iteration in range(iteration_start, max_iter):
 
-        # Current active library
         Theta_active = Theta[:, active_indices]
 
-        # MI optimisation
         try:
+
             result = minimize(
                 scipy_objective,
                 x0=np.ones(len(active_indices)),
@@ -60,7 +132,8 @@ def sparse_ee_interpretation(
                 "iteration": iteration - 1,
                 "active_indices": active_indices,
                 "threshold": threshold,
-                "method": method
+                "method": method,
+                "history": history,
             }
 
             with open(checkpoint_file, "wb") as f:
@@ -71,21 +144,30 @@ def sparse_ee_interpretation(
 
             return
 
-        # Recover direction + gamma scaling
         coeff = result.x.astype(float)
-        coeff /= np.linalg.norm(coeff)
-        
+
+        coeff_norm = np.linalg.norm(coeff)
+
+        if coeff_norm == 0:
+            raise ValueError(
+                "Optimisation returned zero coefficient vector."
+            )
+
+        coeff /= coeff_norm
+
         z = Theta_active @ coeff
-        gamma = np.cov(z, y, bias=True)[0,1] / np.var(z)
+
+        gamma = calculate_gamma(z, y)
+
         coeff *= gamma
 
-        # Fix sign ambiguity
         idx = np.argmax(np.abs(coeff))
+
         if coeff[idx] < 0:
             coeff *= -1
-            
+
         history.append({
-            "iteration": iteration+1,
+            "iteration": iteration + 1,
             "mi": -result.fun,
             "coeff": coeff.copy(),
             "active_indices": active_indices.copy(),
@@ -98,39 +180,43 @@ def sparse_ee_interpretation(
         print(f"MI              : {-result.fun:.6f}")
         print(f"Active features : {len(active_indices)}")
 
-        # Threshold
         keep = np.abs(coeff) >= threshold
 
         # Prevent removing all features
         if not np.any(keep):
             keep[np.argmax(np.abs(coeff))] = True
 
-        # Display
         for name, c, selected in zip(
             np.array(feature_names)[active_indices],
             coeff,
             keep
         ):
-            status = "KEEP" if selected else "REMOVE"
-            print(f"{name:35s}: {c: .6f}  {status}")
 
-        # Stop if no feature removed
+            status = "KEEP" if selected else "REMOVE"
+
+            print(
+                f"{name:35s}: "
+                f"{c: .6f}  {status}"
+            )
+
         if np.all(keep):
             break
 
         active_indices = active_indices[keep]
-        
+
         if save_every_iteration:
+
             checkpoint = {
                 "iteration": iteration,
                 "active_indices": active_indices,
                 "threshold": threshold,
-                "method": method
+                "method": method,
+                "history": history,
             }
+
             with open(checkpoint_file, "wb") as f:
                 pickle.dump(checkpoint, f)
 
-    # Final re-optimisation
     Theta_final = Theta[:, active_indices]
 
     final_result = minimize(
@@ -141,13 +227,24 @@ def sparse_ee_interpretation(
     )
 
     final_coeff = final_result.x.astype(float)
-    final_coeff /= np.linalg.norm(final_coeff)
-    
+
+    final_norm = np.linalg.norm(final_coeff)
+
+    if final_norm == 0:
+        raise ValueError(
+            "Final optimisation returned zero coefficient vector."
+        )
+
+    final_coeff /= final_norm
+
     z = Theta_final @ final_coeff
-    gamma = np.cov(z, y, bias=True)[0,1] / np.var(z)
+
+    gamma = calculate_gamma(z, y)
+
     final_coeff *= gamma
 
     idx = np.argmax(np.abs(final_coeff))
+
     if final_coeff[idx] < 0:
         final_coeff *= -1
 
@@ -163,16 +260,22 @@ def sparse_ee_interpretation(
     terms = []
 
     for name, c in zip(final_names, final_coeff):
-        print(f"{name:35s}: {c:.6f}")
-        terms.append(f"{c:.4f}*{name}")
+
+        print(
+            f"{name:35s}: "
+            f"{c:.6f}"
+        )
+
+        terms.append(
+            f"{c:.4f}*{name}"
+        )
 
     print("\nu ∝")
     print(" + ".join(terms))
 
-    #clear
     if os.path.exists(checkpoint_file):
         os.remove(checkpoint_file)
-    
+
     return {
         "coeff": final_coeff,
         "library_feature_names": feature_names,
@@ -182,7 +285,7 @@ def sparse_ee_interpretation(
         "scaler": scaler,
         "mi": -final_result.fun,
         "result": final_result,
-        "history": history
+        "history": history,
     }
 
 def refine_sparse_result(
